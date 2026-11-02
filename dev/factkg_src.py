@@ -120,13 +120,16 @@ def n_facts(rt):
     m = re.findall(r"num(\d)", rt)
     return max(int(x) for x in m) if m else (0 if "existence" in rt else -1)
 
+def as_list(x):
+    return [] if x is None else list(x)   # parquet lists arrive as numpy arrays
+
 def to_claim(r):
     claim = r["question"].split("Claim:", 1)[-1].strip()
-    docs = [str(d) for d in (r["documents"] or [])] or ["(no facts)"]
+    docs = [str(d) for d in as_list(r["documents"])] or ["(no facts)"]
     correct = str(r["correct_answer"]).strip()
     return dict(claim=claim, docs=docs, label=correct, options=[correct, "False" if correct == "True" else "True"],
                 reasoning=str(r["reasoning_type"]), n_facts=n_facts(str(r["reasoning_type"])), style=str(r["style"]),
-                entities=list(r["entities"] or []))
+                entities=[str(e) for e in as_list(r["entities"])])
 
 train_df = load_dataset(DATA_REPO, split="train").to_pandas()
 test_df = load_dataset(DATA_REPO, split="test").to_pandas()

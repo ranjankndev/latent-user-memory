@@ -34,7 +34,7 @@ if "--build-only" in sys.argv:
     sys.exit(0)
 
 # ---------------- smoke test ----------------
-import torch, pandas as pd
+import torch, pandas as pd, numpy as np
 import matplotlib
 matplotlib.use("Agg")
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
@@ -75,9 +75,9 @@ def make_factkg(n):
         ents = [f"Entity{rnd.randint(0, 30)}" for _ in range(rnd.randint(1, 3))]
         docs = [f"{rnd.choice(ents)} → {rnd.choice(WORDS)} → {rnd.choice(WORDS)} {rnd.randint(1, 99)}" for _ in range(rnd.randint(1, 40))]
         rt = rnd.choice(["num1", "num2|substitution", "num3", "existence", "negation|num2", "num4"])
-        rows.append(dict(question=f"Is the following claim true or false? Claim: {ents[0]} {sent(6)}", documents=docs,
+        rows.append(dict(question=f"Is the following claim true or false? Claim: {ents[0]} {sent(6)}", documents=np.array(docs, dtype=object),
                          correct_answer=rnd.choice(["True", "False"]), reasoning_type=rt, style=rnd.choice(["written", "colloquial"]),
-                         entities=ents))
+                         entities=np.array(ents, dtype=object)))
     return pd.DataFrame(rows)
 
 if FACTKG:
