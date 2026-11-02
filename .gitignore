@@ -1,0 +1,8 @@
+cache/
+memorilla_out/
+kaggle_out/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+kaggle.json
+credentials.json
