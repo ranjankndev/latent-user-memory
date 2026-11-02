@@ -22,7 +22,7 @@
 #
 # **Scoring.** PersonaMem-v2 gives 1 correct + 3 incorrect answers per question. The frozen LLM scores each option by average log-likelihood; the highest wins. Random guess = 25%.
 #
-# **Runtime.** Runs on Kaggle or Colab. T4: about 1.5–2.5 h with the default config (most of it is embedding the histories and the full-context baseline). L4/A100: much faster. Set `QUICK_RUN = True` for a ~15 min end-to-end check.
+# **Runtime.** Runs on Kaggle or Colab. T4: about 1.5–2.5 h with the default config (most of it is embedding the histories and the full-context baseline). L4/A100: much faster. Set `QUICK_RUN = True` for a ~30 min end-to-end check.
 #
 # **Kaggle:** turn on *Internet* and a *GPU T4* accelerator. Outputs land in `/kaggle/working/memorilla_out` (the notebook's Output tab).
 #
@@ -37,7 +37,7 @@
 
 # %%
 import os
-QUICK_RUN = False      # True: tiny sizes, ~15 min end-to-end check
+QUICK_RUN = False      # True: small sizes, ~30 min end-to-end check
 
 LLM_NAME = "Qwen/Qwen3-0.6B"              # frozen decoder (try "Qwen/Qwen3-1.7B" on L4/A100)
 ENC_NAME = "Qwen/Qwen3-Embedding-0.6B"    # frozen encoder for the memory store and RAG
@@ -59,12 +59,14 @@ MAX_Q_TOKENS = 128
 MAX_ANS_TOKENS = 80
 EPOCHS = 2
 LR = 2e-4
-TAU = 0.1               # temperature of the multiple-choice loss
+TAU = 0.3               # temperature of the multiple-choice loss
 NLL_WEIGHT = 0.5        # weight of the paper's answer-NLL loss
+PREF_WEIGHT = 1.0       # weight of the auxiliary loss: say the user's hidden preference from memory (training only)
+PREFILL_CHUNK = 1024    # feed long prompts in pieces so a 30K-token prompt fits on a T4
 SEED = 0
 
 if QUICK_RUN:
-    N_TRAIN_HIST, N_TEST_HIST, N_EVAL, N_FULL_EVAL, EPOCHS = 40, 10, 60, 15, 1
+    N_TRAIN_HIST, N_TEST_HIST, N_EVAL, N_FULL_EVAL, EPOCHS = 80, 10, 100, 15, 2
 
 ON_KAGGLE = os.path.exists("/kaggle/working")
 CACHE_DIR = "/tmp/lum_cache" if ON_KAGGLE else "cache"   # on Colab, point this to Google Drive to keep embeddings
@@ -283,10 +285,12 @@ def embed_ids(ids):
 @torch.no_grad()
 def score_options(prefix_embeds, options):
     """Mean log-prob of each option after the prefix. The prefix is computed once and reused (KV cache)."""
-    L = prefix_embeds.shape[1]
-    with amp():
-        out = llm(inputs_embeds=prefix_embeds, use_cache=True, logits_to_keep=1)
-    cache, first = out.past_key_values, out.logits[:, -1].float()
+    cache = None
+    for s0 in range(0, prefix_embeds.shape[1], PREFILL_CHUNK):    # chunked prefill keeps attention memory small
+        with amp():
+            out = llm(inputs_embeds=prefix_embeds[:, s0:s0 + PREFILL_CHUNK], past_key_values=cache, use_cache=True, logits_to_keep=1)
+        cache = out.past_key_values
+    first = out.logits[:, -1].float()
     scores = []
     for o in options:
         ids = ans_ids(o).to(DEV)[None]
@@ -368,15 +372,18 @@ print(f"trainable params: {sum(p.numel() for p in mem.parameters()) / 1e6:.1f}M 
 
 # %% [markdown]
 # ## 6. Train
-# Loss = multiple-choice cross-entropy over the 4 options' log-likelihoods + `NLL_WEIGHT` × the paper's answer NLL. Gradients flow through the frozen LLM into the soft tokens.
+# Loss = multiple-choice cross-entropy over the 4 options' log-likelihoods + `NLL_WEIGHT` × the paper's answer NLL + `PREF_WEIGHT` × NLL of the user's hidden preference (e.g. *"worried about rising medication costs"*) generated from the memory tokens. The last term is a training-only signal that teaches the slots *what* to carry, in the spirit of the paper's reconstruction pre-training. It is never used at evaluation. Gradients flow through the frozen LLM into the soft tokens.
 
 # %%
-def option_logprobs(M, qs):
-    """Differentiable mean log-prob of every option, given soft tokens M [B,K,H]. Returns [B, n_opts]."""
-    seqs, targets = [], []
+PREF_LEAD = "From what you have told me before: "
+
+def option_logprobs(M, qs, with_pref=False):
+    """Differentiable mean log-prob of every option, given soft tokens M [B,K,H]. Returns [B, n_opts (+1 if with_pref)].
+    with_pref adds one more target per question: the user's hidden preference, as a training-only auxiliary signal."""
+    seqs = []
     for i, q in enumerate(qs):
         prefix = torch.cat([M[i], embed_ids(chat_ids(q["query"])).to(M.dtype)], 0)
-        for o in q["options"]:
+        for o in q["options"] + ([PREF_LEAD + q["preference"]] if with_pref else []):
             a = ans_ids(o).to(DEV)
             seqs.append((torch.cat([prefix, embed_ids(a).to(M.dtype)], 0), prefix.shape[0], a))
     T = max(s[0].shape[0] for s in seqs)
@@ -411,16 +418,19 @@ for ep in range(EPOCHS):
     for b in range(0, len(order), BATCH):
         qs = [train_q[i] for i in order[b:b + BATCH]]
         M, _ = memory_for(qs)
-        s = option_logprobs(M, qs)
-        loss = F.cross_entropy(s / TAU, torch.zeros(len(qs), dtype=torch.long, device=DEV)) + NLL_WEIGHT * (-s[:, 0].mean())
+        s = option_logprobs(M, qs, with_pref=PREF_WEIGHT > 0)
+        s, s_pref = (s[:, :-1], s[:, -1]) if PREF_WEIGHT > 0 else (s, torch.zeros(len(qs), device=DEV))
+        loss = (F.cross_entropy(s / TAU, torch.zeros(len(qs), dtype=torch.long, device=DEV))
+                + NLL_WEIGHT * (-s[:, 0].mean()) + PREF_WEIGHT * (-s_pref.mean()))
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(mem.parameters(), 1.0)
         scaler.step(opt); scaler.update(); sched.step(); step += 1
-        history.append(dict(step=step, loss=loss.item(), acc=(s.argmax(1) == 0).float().mean().item()))
+        history.append(dict(step=step, loss=loss.item(), acc=(s.argmax(1) == 0).float().mean().item(), pref_nll=-s_pref.mean().item()))
         if step % 50 == 0 or step == steps:
             h = pd.DataFrame(history[-50:])
-            print(f"ep {ep} step {step}/{steps} loss {h.loss.mean():.3f} train-acc {h.acc.mean():.1%} {time.time() - t0:.0f}s")
+            print(f"ep {ep} step {step}/{steps} loss {h.loss.mean():.3f} train-acc {h.acc.mean():.1%} "
+                  f"pref-nll {h.pref_nll.mean():.2f} amp-scale {scaler.get_scale() if scaler.is_enabled() else 1:.0f} {time.time() - t0:.0f}s")
 mem.eval()
 torch.save(mem.state_dict(), os.path.join(OUT_DIR, "memory_module.pt"))
 
