@@ -36,6 +36,8 @@ Each question has 1 correct and 3 incorrect personalized answers. The frozen LLM
 3. Optional: set `QUICK_RUN = True` in the config cell for a ~15 min check first.
 4. **Save Version → Save & Run All (Commit)**. Results appear in the Output tab under `memorilla_out/`.
 
+**Kaggle from the command line**: with the Kaggle CLI signed in, `python dev/kaggle_push.py --user <kaggle-username> --quick` pushes a private T4 job (drop `--quick` for the full run). `kaggle kernels output <user>/latent-user-memory -p kaggle_out` downloads the results.
+
 **Colab**: open the notebook, Runtime → GPU, Run all. Point `CACHE_DIR` at Google Drive to keep embeddings across disconnects.
 
 Default config: 400 training users, 100 held-out users, 500 eval questions (150 with the full-context baseline). About 1.5–2.5 h on a T4.
