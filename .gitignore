@@ -6,3 +6,5 @@ __pycache__/
 .ipynb_checkpoints/
 kaggle.json
 credentials.json
+latent_kb_out/
+cache_fkg/

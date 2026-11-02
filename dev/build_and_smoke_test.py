@@ -1,10 +1,14 @@
-"""Build the .ipynb from nb_src.py, then smoke-test every code cell on CPU with tiny stub models + fake data."""
+"""Build an .ipynb from a notebook source file, then smoke-test every code cell on CPU with tiny stub models + fake data.
+
+Usage: python dev/build_and_smoke_test.py OUT.ipynb [--src dev/factkg_src.py] [--build-only]
+"""
 import json, os, random, sys, re, types
 import nbformat as nbf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "notebook_src.py")
+SRC = sys.argv[sys.argv.index("--src") + 1] if "--src" in sys.argv else os.path.join(HERE, "notebook_src.py")
 OUT = sys.argv[1]
+FACTKG = "factkg" in os.path.basename(SRC).lower()
 
 
 def parse_cells(src):
@@ -65,7 +69,21 @@ def make_split(prefix, users, per_user):
                              updated=rnd.random() < 0.3, pref_type=rnd.choice(["a", "b"]), preference=sent(6)))
     return pd.DataFrame(rows)
 
-dfs = {"train_text": make_split("tr", range(5), 6), "benchmark_text": make_split("te", range(100, 103), 6)}
+def make_factkg(n):
+    rows = []
+    for i in range(n):
+        ents = [f"Entity{rnd.randint(0, 30)}" for _ in range(rnd.randint(1, 3))]
+        docs = [f"{rnd.choice(ents)} → {rnd.choice(WORDS)} → {rnd.choice(WORDS)} {rnd.randint(1, 99)}" for _ in range(rnd.randint(1, 40))]
+        rt = rnd.choice(["num1", "num2|substitution", "num3", "existence", "negation|num2", "num4"])
+        rows.append(dict(question=f"Is the following claim true or false? Claim: {ents[0]} {sent(6)}", documents=docs,
+                         correct_answer=rnd.choice(["True", "False"]), reasoning_type=rt, style=rnd.choice(["written", "colloquial"]),
+                         entities=ents))
+    return pd.DataFrame(rows)
+
+if FACTKG:
+    dfs = {"train": make_factkg(40), "test": make_factkg(15)}
+else:
+    dfs = {"train_text": make_split("tr", range(5), 6), "benchmark_text": make_split("te", range(100, 103), 6)}
 
 # tiny byte-level BPE tokenizer with a chat template
 corpus = [sent(30) for _ in range(300)] + ["User: Assistant: System: unique marker ? . , 0123456789"]
@@ -96,7 +114,7 @@ class DS:
     def __init__(self, df): self.df = df
     def to_pandas(self): return self.df.copy()
 
-def stub_load_dataset(repo, config, split): return DS(dfs[split])
+def stub_load_dataset(repo, config=None, split=None): return DS(dfs[split])
 def stub_snapshot(repo, repo_type, allow_patterns, local_dir):
     assert all(os.path.exists(os.path.join("pmdata", p)) for p in allow_patterns); return os.path.abspath("pmdata")
 
@@ -108,12 +126,14 @@ for idx, code in enumerate(code_cells):
         continue
     print(f"--- cell {idx}: {code.strip().splitlines()[0][:70]}")
     exec(compile(code, f"cell{idx}", "exec"), ns)
-    if "LLM_NAME =" in code:   # shrink config for CPU
+    if "LLM_NAME =" in code and FACTKG:   # shrink config for CPU
+        ns.update(N_TRAIN=24, N_EVAL=10, K_SLOTS=4, N_HEADS=4, RAG_KS=[2, 5], EPOCHS=2, CACHE_DIR="cache_fkg", OUT_DIR="out_fkg")
+    elif "LLM_NAME =" in code:
         ns.update(N_TRAIN_HIST=5, N_TEST_HIST=3, N_EVAL=12, N_FULL_EVAL=6, CHUNK_TOKENS=64, K_SLOTS=4, N_HEADS=4,
                   FULL_CTX_MAX_TOKENS=1500, MAX_ANS_TOKENS=24, EPOCHS=2, CACHE_DIR="cache", OUT_DIR="out")
     if "from transformers import" in code:
         ns.update(load_dataset=stub_load_dataset, snapshot_download=stub_snapshot, AutoTokenizer=StubAutoTok,
                   AutoModel=StubAutoModel, AutoModelForCausalLM=StubCausal)
 
-print("\nSMOKE OK. outputs:", sorted(os.listdir("out")))
+print("\nSMOKE OK. outputs:", sorted(os.listdir(ns["OUT_DIR"])))
 print(ns["table"].to_string())
