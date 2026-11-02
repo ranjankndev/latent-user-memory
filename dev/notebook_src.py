@@ -20,7 +20,7 @@
 #
 # 4. Makes charts for a post: accuracy vs tokens, accuracy vs how far back the memory is, preference-update cases, "did the model look at the right chunk?", and an attention GIF.
 #
-# **Scoring.** PersonaMem-v2 gives 1 correct + 3 incorrect answers per question. The frozen LLM scores each option by average log-likelihood; the highest wins. Random guess = 25%.
+# **Scoring.** PersonaMem-v2 gives 1 correct + 3 incorrect answers per question. The options are long and differ only in a small personal detail, so plain likelihood mostly measures fluency. Each method therefore scores an option by **how much its memory raises the option's average log-likelihood compared with no memory** (PMI calibration, Holtzman et al. 2021). The highest wins. Closed-book has no memory, so it uses plain likelihood. Random guess = 25%. Uncalibrated accuracies are kept as `*_raw` columns.
 #
 # **Runtime.** Runs on Kaggle or Colab. T4: about 1.5–2.5 h with the default config (most of it is embedding the histories and the full-context baseline). L4/A100: much faster. Set `QUICK_RUN = True` for a ~30 min end-to-end check.
 #
@@ -94,6 +94,7 @@ print("HF token:", load_hf_token() or "none (fine for public models)", "| quick 
 
 # %%
 import os, json, ast, math, random, time, re
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # less fragmentation on a 15 GB T4
 import numpy as np, pandas as pd
 import torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -106,7 +107,8 @@ from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 BF16 = DEV == "cuda" and torch.cuda.get_device_capability()[0] >= 8   # T4 has no real bf16
 AMP_DTYPE = torch.bfloat16 if BF16 else torch.float16
-BATCH = 8 if BF16 else 4
+BATCH = 8 if BF16 else 2          # questions per micro-batch
+GRAD_ACCUM = 1 if BF16 else 2     # micro-batches per optimizer step
 
 def amp():
     return torch.autocast("cuda", dtype=AMP_DTYPE) if DEV == "cuda" else nullcontext()
@@ -380,14 +382,16 @@ PREF_LEAD = "From what you have told me before: "
 def option_logprobs(M, qs, with_pref=False):
     """Differentiable mean log-prob of every option, given soft tokens M [B,K,H]. Returns [B, n_opts (+1 if with_pref)].
     with_pref adds one more target per question: the user's hidden preference, as a training-only auxiliary signal."""
+    dt = M.dtype if M is not None else EMB.weight.dtype   # M=None scores the options with no memory
     seqs = []
     for i, q in enumerate(qs):
-        prefix = torch.cat([M[i], embed_ids(chat_ids(q["query"])).to(M.dtype)], 0)
+        prefix = embed_ids(chat_ids(q["query"])).to(dt)
+        prefix = torch.cat([M[i], prefix], 0) if M is not None else prefix
         for o in q["options"] + ([PREF_LEAD + q["preference"]] if with_pref else []):
             a = ans_ids(o).to(DEV)
-            seqs.append((torch.cat([prefix, embed_ids(a).to(M.dtype)], 0), prefix.shape[0], a))
+            seqs.append((torch.cat([prefix, embed_ids(a).to(dt)], 0), prefix.shape[0], a))
     T = max(s[0].shape[0] for s in seqs)
-    X = torch.zeros(len(seqs), T, H_LLM, device=DEV, dtype=M.dtype)
+    X = torch.zeros(len(seqs), T, H_LLM, device=DEV, dtype=dt)
     att = torch.zeros(len(seqs), T, dtype=torch.long, device=DEV)
     rows, cols, tgt, seg = [], [], [], []
     for j, (x, P, a) in enumerate(seqs):
@@ -408,30 +412,39 @@ def memory_for(qs, links=None):
     return mem(Z, mask, zq)
 
 opt = torch.optim.AdamW(mem.parameters(), lr=LR, weight_decay=0.01)
-steps = EPOCHS * math.ceil(len(train_q) / BATCH)
+steps = EPOCHS * math.ceil(len(train_q) / (BATCH * GRAD_ACCUM))
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / (0.05 * steps)) * 0.5 * (1 + math.cos(math.pi * min(s, steps) / steps)))
 scaler = torch.amp.GradScaler("cuda", enabled=DEV == "cuda" and not BF16)
 history, step, t0 = [], 0, time.time()
 mem.train()
 for ep in range(EPOCHS):
     order = list(range(len(train_q))); random.shuffle(order)
-    for b in range(0, len(order), BATCH):
-        qs = [train_q[i] for i in order[b:b + BATCH]]
-        M, _ = memory_for(qs)
-        s = option_logprobs(M, qs, with_pref=PREF_WEIGHT > 0)
-        s, s_pref = (s[:, :-1], s[:, -1]) if PREF_WEIGHT > 0 else (s, torch.zeros(len(qs), device=DEV))
-        loss = (F.cross_entropy(s / TAU, torch.zeros(len(qs), dtype=torch.long, device=DEV))
-                + NLL_WEIGHT * (-s[:, 0].mean()) + PREF_WEIGHT * (-s_pref.mean()))
+    for b in range(0, len(order), BATCH * GRAD_ACCUM):
+        group = order[b:b + BATCH * GRAD_ACCUM]
         opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        stats = []
+        for a0 in range(0, len(group), BATCH):
+            qs = [train_q[i] for i in group[a0:a0 + BATCH]]
+            with torch.no_grad():
+                base = option_logprobs(None, qs)                  # same options, no memory
+            M, _ = memory_for(qs)
+            s = option_logprobs(M, qs, with_pref=PREF_WEIGHT > 0)
+            s, s_pref = (s[:, :-1], s[:, -1]) if PREF_WEIGHT > 0 else (s, torch.zeros(len(qs), device=DEV))
+            cal = s - base                                         # what the memory adds to each option
+            loss = (F.cross_entropy(cal / TAU, torch.zeros(len(qs), dtype=torch.long, device=DEV))
+                    + NLL_WEIGHT * (-s[:, 0].mean()) + PREF_WEIGHT * (-s_pref.mean()))
+            scaler.scale(loss * len(qs) / len(group)).backward()
+            stats.append((loss.item(), (cal.argmax(1) == 0).float().mean().item(), -s_pref.mean().item()))
         scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(mem.parameters(), 1.0)
         scaler.step(opt); scaler.update(); sched.step(); step += 1
-        history.append(dict(step=step, loss=loss.item(), acc=(s.argmax(1) == 0).float().mean().item(), pref_nll=-s_pref.mean().item()))
+        l, a, pn = np.mean(stats, 0)
+        history.append(dict(step=step, loss=l, acc=a, pref_nll=pn))
         if step % 50 == 0 or step == steps:
             h = pd.DataFrame(history[-50:])
             print(f"ep {ep} step {step}/{steps} loss {h.loss.mean():.3f} train-acc {h.acc.mean():.1%} "
                   f"pref-nll {h.pref_nll.mean():.2f} amp-scale {scaler.get_scale() if scaler.is_enabled() else 1:.0f} {time.time() - t0:.0f}s")
 mem.eval()
+if DEV == "cuda": torch.cuda.empty_cache()
 torch.save(mem.state_dict(), os.path.join(OUT_DIR, "memory_module.pt"))
 
 # %% [markdown]
@@ -449,9 +462,15 @@ other = {l: test_links[(i + 1) % len(test_links)] for i, l in enumerate(test_lin
 for n, q in enumerate(test_q):
     r = dict(i=n, query=q["query"], distance=q["distance"], updated=q["updated"], pref_type=q["pref_type"], gold=q["gold"],
              n_chunks=len(store[q["link"]]["chunks"]))
+    base = {}
     def run(name, prefix, mem_tokens):
         sc, sec = timed(lambda: score_options(prefix, q["options"]))
-        r[name], r[name + "_pick"], r[name + "_tok"], r[name + "_sec"] = int(np.argmax(sc) == 0), int(np.argmax(sc)), mem_tokens, sec
+        sc = np.array(sc)
+        if name == "closed_book":
+            base["sc"] = sc
+        cal = sc if name == "closed_book" else sc - base["sc"]    # PMI: what this memory adds vs no memory
+        r[name], r[name + "_pick"], r[name + "_tok"], r[name + "_sec"] = int(np.argmax(cal) == 0), int(np.argmax(cal)), mem_tokens, sec
+        r[name + "_raw"] = int(np.argmax(sc) == 0)
     with torch.no_grad():
         run("closed_book", embed_ids(chat_ids(q["query"]))[None], 0)
         text, ntok, top = rag_text(q)
@@ -488,12 +507,13 @@ table = pd.DataFrame([dict(method=lbl,
                            acc_all=res[m].mean() if m in res else np.nan,
                            ci95=ci(res[m]) if m in res else np.nan,
                            acc_full_subset=sub[m].mean() if m in sub else np.nan,
+                           acc_raw_full_subset=sub[m + "_raw"].mean() if m + "_raw" in sub else np.nan,
                            memory_tokens=res[m + "_tok"].mean() if m in res else np.nan,
                            sec_per_question=res[m + "_sec"].mean() if m in res else np.nan)
                       for m, lbl in METHODS])
 table.to_csv(os.path.join(OUT_DIR, "results_table.csv"), index=False)
 print(f"eval questions: {len(res)} (full context on first {len(sub)}). Random guess = 25%.")
-table.style.format({"acc_all": "{:.1%}", "ci95": "±{:.1%}", "acc_full_subset": "{:.1%}", "memory_tokens": "{:,.0f}", "sec_per_question": "{:.2f}"})
+table.style.format({"acc_all": "{:.1%}", "ci95": "±{:.1%}", "acc_full_subset": "{:.1%}", "acc_raw_full_subset": "{:.1%}", "memory_tokens": "{:,.0f}", "sec_per_question": "{:.2f}"})
 
 # %% [markdown]
 # ## 9. Charts for the post

@@ -26,7 +26,7 @@ It is an independent, scaled-down implementation, not the authors' code.
 | Latent memory (Memorilla-mini) | 16 soft tokens |
 | Latent memory, wrong user | 16 soft tokens from another user's history (sanity check) |
 
-Each question has 1 correct and 3 incorrect personalized answers. The frozen LLM picks the option with the highest mean log-likelihood (random = 25%).
+Each question has 1 correct and 3 incorrect personalized answers that differ only in a small personal detail. Each method scores an option by how much its memory raises the option's mean log-likelihood compared with no memory (PMI calibration); the highest wins (random = 25%). The same calibrated score is used in the training loss.
 
 ## Run it
 
