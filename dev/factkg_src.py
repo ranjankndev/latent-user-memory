@@ -24,7 +24,7 @@
 #
 # **Scoring.** The LLM compares the likelihood of answering `True` vs `False`.
 #
-# **Runtime.** Kaggle or Colab T4: about 1–1.5 h with the default config. Set `QUICK_RUN = True` for a ~25 min end-to-end check. **Kaggle:** turn on *Internet* and a *GPU T4* accelerator; outputs land in `/kaggle/working/latent_kb_out`.
+# **Runtime.** Kaggle or Colab T4: about 3 h with the default config. Set `QUICK_RUN = True` for a ~25 min end-to-end check. **Kaggle:** turn on *Internet* and a *GPU T4* accelerator; outputs land in `/kaggle/working/latent_kb_out`.
 #
 # **Honest notes.** Scaled-down model pair (0.6B encoder + 0.6B LLM vs 4B + 8B in the paper) and a single training stage, so absolute numbers will differ from the paper.
 
@@ -43,7 +43,7 @@ LLM_NAME = "Qwen/Qwen3-0.6B"              # frozen decoder (try "Qwen/Qwen3-1.7B
 ENC_NAME = "Qwen/Qwen3-Embedding-0.6B"    # frozen encoder for the memory store and RAG
 DATA_REPO = "MemoryAsModality/FactKG"
 
-N_TRAIN = 10000         # training claims (of ~86K)
+N_TRAIN = 30000         # training claims (of ~86K)
 N_EVAL = 1000           # held-out test claims (of ~9K)
 
 K_SLOTS = 16            # memory tokens given to the LLM (paper: 16)
