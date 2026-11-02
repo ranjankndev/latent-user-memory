@@ -17,7 +17,7 @@ It is an independent, scaled-down implementation, not the authors' code.
 
 | Notebook | Use case | Dataset | Status |
 |---|---|---|---|
-| [`latent_kb_memory_factkg.ipynb`](latent_kb_memory_factkg.ipynb) | **Checking claims against a knowledge base** (support, sales, compliance) | [FactKG](https://huggingface.co/datasets/MemoryAsModality/FactKG): 86K train / 9K test claims, each with up to 200 knowledge-graph facts | main experiment |
+| [`latent_kb_memory_factkg.ipynb`](latent_kb_memory_factkg.ipynb) | **Checking claims against a knowledge base** (support, sales, compliance) | [FactKG](https://huggingface.co/datasets/MemoryAsModality/FactKG): 86K train / 9K test claims, each with up to 200 knowledge-graph facts | main experiment, results below |
 | [`latent_user_memory.ipynb`](latent_user_memory.ipynb) | Assistant memory of a user's ~32K-token chat history | [PersonaMem-v2](https://huggingface.co/datasets/bowen-upenn/PersonaMem-v2) (CC-BY-4.0) | negative result at this scale (below) |
 
 ### FactKG: knowledge-base claim checking
@@ -35,6 +35,24 @@ A claim must be judged **True or False** from the claim's own knowledge-graph fa
 Outputs (`latent_kb_out/`): `1_accuracy_vs_tokens.png`, `2_accuracy_vs_facts_combined.png` (the paper's Fig. 4c question), `3_accuracy_vs_kb_size.png`, `4_memory_attention.gif` (each slot's most-read facts), `results_table.csv`, `results_per_claim.csv`, `memory_module.pt`.
 
 Training adds a training-only auxiliary loss: the LLM must restate the claim's most similar fact from the memory tokens, so the slots learn to carry fact content (in the spirit of the paper's reconstruction pre-training).
+
+**Results** (full run: 30K training claims, 1,000 held-out test claims, frozen Qwen3-0.6B on a Kaggle T4; files in [`results/factkg/`](results/factkg)):
+
+| Method | Accuracy (±95% CI) | Memory tokens | Seconds per claim |
+|---|---|---|---|
+| Closed-book | 50.9% ± 3.1 | 0 | 0.17 |
+| RAG top-5 | 65.0% ± 3.0 | ~68 | 0.17 |
+| RAG top-20 | 67.2% ± 2.9 | ~258 | 0.18 |
+| Full context | 64.7% ± 3.0 | ~1,694 | 0.53 |
+| **Latent memory** | **65.9% ± 2.9** | **16** | **0.17** |
+| Latent memory, wrong facts | 59.7% ± 3.0 | 16 | 0.17 |
+
+- Latent memory matches full context and RAG (paired tests: p = 0.58 vs full context, 0.52 vs RAG top-20) with **106x fewer tokens than full context**.
+- It uses the facts: it beats the same module given another claim's facts by 6.2 points (p = 0.0001).
+- As claims combine more facts, text methods drop (RAG top-5: 75% at 1 fact → 53% at 3), while latent memory stays at 62–66%. On claims with 151–200 facts it is the best method (64.0% vs 60.6% full context, n = 505).
+- The two are complementary: 16.4% of claims are solved only by latent memory and 17.7% only by RAG top-20; either one is right on 83.6%.
+
+Caveats: the memory module is trained on FactKG, while the text baselines are zero-shot; the wrong-facts control (59.7%) shows that about 9 of its 15 points over closed-book come from what the module learned about claims in general, and about 6 from the facts. Per-bucket numbers rest on 115–505 claims each (±4–9 points). All methods lean towards answering False with this small LLM.
 
 ### PersonaMem-v2: what happened
 
